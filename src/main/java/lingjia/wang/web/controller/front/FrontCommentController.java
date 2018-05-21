@@ -1,0 +1,196 @@
+package lingjia.wang.web.controller.front;
+
+import lingjia.wang.model.domain.Comment;
+import lingjia.wang.model.domain.Post;
+import lingjia.wang.model.dto.HaloConst;
+import lingjia.wang.service.CommentService;
+import lingjia.wang.service.MailService;
+import lingjia.wang.service.PostService;
+import lingjia.wang.service.UserService;
+import lingjia.wang.utils.HaloUtils;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.annotation.*;
+
+import javax.servlet.http.HttpServletRequest;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * @author : RYAN0UP
+ * @version : 1.0
+ * @date : 2018/4/26
+ */
+@Slf4j
+@Controller
+public class FrontCommentController {
+
+    @Autowired
+    private CommentService commentService;
+
+    @Autowired
+    private PostService postService;
+
+    @Autowired
+    private UserService userService;
+
+    @Autowired
+    private MailService mailService;
+
+    /**
+     * 获取文章的评论
+     *
+     * @param postId postId 文章编号
+     * @return List<Comment>集合</>
+     */
+    @GetMapping(value = "/getComment/{postId}", produces = MediaType.APPLICATION_JSON_UTF8_VALUE)
+    @ResponseBody
+    public List<Comment> getComment(@PathVariable Long postId) {
+        Optional<Post> post = postService.findByPostId(postId);
+        Sort sort = new Sort(Sort.Direction.DESC, "commentDate");
+        Pageable pageable = PageRequest.of(0, 10, sort);
+        List<Comment> comments = commentService.findCommentsByPostAndCommentStatus(post.get(), pageable, 2).getContent();
+        if (null == comments) {
+            return null;
+        }
+        return comments;
+    }
+
+    /**
+     * 加载评论
+     *
+     * @param page 页码
+     * @param post 当前文章
+     * @return List<Comment></>
+     */
+    @GetMapping(value = "/loadComment")
+    @ResponseBody
+    public List<Comment> loadComment(@RequestParam(value = "page") Integer page,
+                                     @RequestParam(value = "post") Post post){
+        Sort sort = new Sort(Sort.Direction.DESC,"commentDate");
+        Pageable pageable = PageRequest.of(page-1,10,sort);
+        List<Comment> comments = commentService.findCommentsByPostAndCommentStatus(post,pageable,2).getContent();
+        return comments;
+    }
+
+    /**
+     * 提交新评论
+     *
+     * @param comment comment实体
+     * @param post    post实体
+     * @param request request
+     * @return true：评论成功，false：评论失败
+     */
+    @PostMapping(value = "/newComment")
+    @ResponseBody
+    public boolean newComment(@ModelAttribute("comment") Comment comment,
+                              @ModelAttribute("post") Post post,
+                              HttpServletRequest request) {
+        Comment lastComment = null;
+        post = postService.findByPostId(post.getPostId()).get();
+        comment.setCommentAuthorEmail(comment.getCommentAuthorEmail().toLowerCase());
+        comment.setPost(post);
+        comment.setCommentDate(new Date());
+        comment.setCommentAuthorIp(HaloUtils.getIpAddr(request));
+        comment.setIsAdmin(0);
+        if(comment.getCommentParent()>0){
+            lastComment = commentService.findCommentById(comment.getCommentParent()).get();
+            String lastContent = " //<a href='#comment-id-"+lastComment.getCommentId()+"'>@"+lastComment.getCommentAuthor()+"</a>:"+lastComment.getCommentContent();
+            comment.setCommentContent(StringUtils.substringAfter(comment.getCommentContent(),":")+lastContent);
+        }
+        if(StringUtils.isNotEmpty(comment.getCommentAuthorUrl())){
+            if(!StringUtils.containsAny(comment.getCommentAuthorUrl(),"https://") || !StringUtils.containsAny(comment.getCommentAuthorUrl(),"http://")){
+                comment.setCommentAuthorUrl("http://"+comment.getCommentAuthorUrl());
+            }
+        }
+        commentService.saveByComment(comment);
+        if(comment.getCommentParent()>0){
+            //new EmailToParent(comment,lastComment,post).start();
+        }else{
+            new EmailToAdmin(comment,post).start();
+        }
+        return true;
+    }
+
+    /**
+     * 发送邮件给博主
+     */
+    class EmailToAdmin extends Thread{
+        private Comment comment;
+        private Post post;
+        public EmailToAdmin(Comment comment, Post post){
+            this.comment = comment;
+            this.post = post;
+        }
+        @Override
+        public void run(){
+            if (StringUtils.equals(HaloConst.OPTIONS.get("smtp_email_enable"), "true") && StringUtils.equals(HaloConst.OPTIONS.get("new_comment_notice"), "true")) {
+                try {
+                    //发送邮件到博主
+                    Map<String, Object> map = new HashMap<>();
+                    map.put("author", userService.findUser().getUserDisplayName());
+                    map.put("pageName", post.getPostTitle());
+                    if (StringUtils.equals(post.getPostType(), HaloConst.POST_TYPE_POST)) {
+                        map.put("pageUrl", HaloConst.OPTIONS.get("blog_url") + "/archives/" + post.getPostUrl() + "#comment-id-" + comment.getCommentId());
+                    } else {
+                        map.put("pageUrl", HaloConst.OPTIONS.get("blog_url") + "/p/" + post.getPostUrl() + "#comment-id-" + comment.getCommentId());
+                    }
+                    map.put("visitor", comment.getCommentAuthor());
+                    map.put("commentContent", comment.getCommentContent());
+                    mailService.sendTemplateMail(userService.findUser().getUserEmail(), "有新的评论", map, "common/mail/mail_admin.ftl");
+                } catch (Exception e) {
+                    log.error("邮件服务器未配置：", e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * 发送邮件给被评论方
+     */
+    class EmailToParent extends Thread{
+        private Comment comment;
+        private Comment lastComment;
+        private Post post;
+        public EmailToParent(Comment comment, Comment lastComment, Post post){
+            this.comment = comment;
+            this.lastComment = lastComment;
+            this.post = post;
+        }
+
+        Pattern patternEmail = Pattern.compile("\\w[-\\w.+]*@([A-Za-z0-9][-A-Za-z0-9]+\\.)+[A-Za-z]{2,14}");
+        Matcher matcher = patternEmail.matcher(lastComment.getCommentAuthorEmail());
+
+        @Override
+        public void run() {
+            //发送通知给对方
+            if(StringUtils.equals(HaloConst.OPTIONS.get("smtp_email_enable"),"true") && StringUtils.equals(HaloConst.OPTIONS.get("comment_reply_notice"),"true")) {
+                if(matcher.find()){
+                    Map<String, Object> map = new HashMap<>();
+                    map.put("blogTitle", HaloConst.OPTIONS.get("blog_title"));
+                    map.put("commentAuthor",lastComment.getCommentAuthor());
+                    map.put("pageName",lastComment.getPost().getPostTitle());
+                    if (StringUtils.equals(post.getPostType(), HaloConst.POST_TYPE_POST)) {
+                        map.put("pageUrl", HaloConst.OPTIONS.get("blog_url") + "/archives/" + post.getPostUrl() + "#comment-id-" + comment.getCommentId());
+                    } else {
+                        map.put("pageUrl", HaloConst.OPTIONS.get("blog_url") + "/p/" + post.getPostUrl() + "#comment-id-" + comment.getCommentId());
+                    }
+                    map.put("commentContent",lastComment.getCommentContent());
+                    map.put("replyAuthor",comment.getCommentAuthor());
+                    map.put("replyContent",comment.getCommentContent());
+                    map.put("blogUrl", HaloConst.OPTIONS.get("blog_url"));
+                    mailService.sendTemplateMail(
+                            lastComment.getCommentAuthorEmail(),"您在"+ HaloConst.OPTIONS.get("blog_title")+"的评论有了新回复",map,"common/mail/mail_reply.ftl");
+                }
+            }
+        }
+    }
+}
+
